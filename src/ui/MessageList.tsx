@@ -14,36 +14,14 @@
  *   every 50 ms so the display updates without thrashing React state.
  */
 
-import React, { useRef } from 'react';
+import React from 'react';
 import { Box, Text } from 'ink';
 import { MarkdownRenderer } from './MarkdownRenderer.js';
+import type { MessageEntry } from './types.js';
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/** Payload shape (no id) — used when calling addEntry in App */
-export type MessageEntryData =
-  | { kind: 'user'; content: string }
-  | { kind: 'assistant'; content: string; isStreaming?: boolean }
-  | {
-      kind: 'tool_call';
-      name: string;
-      toolId: string;
-      status: 'running' | 'done' | 'error';
-      result?: string | undefined;
-      /** Human-readable summary of what the tool is doing, e.g. "src/main.ts" */
-      description?: string | undefined;
-    }
-  | {
-      kind: 'notice';
-      content: string;
-      level: 'info' | 'error' | 'help' | 'success';
-    }
-  | { kind: 'separator'; label: string };
-
-/** Full entry with a stable id for React key */
-export type MessageEntry = MessageEntryData & { id: string };
+// Re-export types for backwards compatibility
+export type { MessageEntry, MessageEntryData } from './types.js';
+export { useStreamingBuffer } from './hooks/useStreamingBuffer.js';
 
 // ---------------------------------------------------------------------------
 // MessageList
@@ -229,36 +207,3 @@ function Separator({ label }: { label: string }): React.ReactElement {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Hook: streaming buffer — ref-based, no internal timer
-//
-// The 50 ms self-flush timer was the primary source of terminal flickering:
-// it fired independently of the 100 ms spinner tick, causing two separate
-// Ink re-draws per 100 ms window.  The buffer is now a plain ref; React
-// re-renders that are already triggered by the spinner tick (every 100 ms
-// while streaming) read the latest buffer value through the getter.
-// The first delta also triggers a re-render via setIsWaiting(false) in App,
-// so latency to first visible character is not affected.
-// ---------------------------------------------------------------------------
-
-interface UseStreamingBufferResult {
-  buffer: string;
-  append: (delta: string) => void;
-  clear: () => void;
-}
-
-export function useStreamingBuffer(): UseStreamingBufferResult {
-  const bufRef = useRef('');
-
-  return {
-    get buffer() {
-      return bufRef.current;
-    },
-    append(delta: string) {
-      bufRef.current += delta;
-    },
-    clear() {
-      bufRef.current = '';
-    },
-  };
-}
