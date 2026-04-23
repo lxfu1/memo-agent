@@ -63,7 +63,7 @@ npm start
 
 # Global installation to use the `memo` command
 npm install -g .
-slave
+memo
 ```
 
 ---
@@ -489,8 +489,8 @@ memo-agent/
 │   │   └── StatusBar.tsx         # Bottom status bar
 │   └── types/
 │       ├── messages.ts           # ChatMessage, StreamEvent
-│       ├── config.ts             # SlaveAgentConfig
-│       ├── errors.ts             # SlaveAgentError discriminated union
+│       ├── config.ts             # MemoAgentConfig
+│       ├── errors.ts             # MemoAgentError discriminated union
 │       ├── tool.ts               # Tool interface
 │       └── session.ts            # SessionRow, MessageRow
 ├── .memo-agent/

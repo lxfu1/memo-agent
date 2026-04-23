@@ -57,7 +57,7 @@ npm start
 
 # 全局安装后使用 memo 命令
 npm install -g .
-slave
+memo
 ```
 
 ---
@@ -483,8 +483,8 @@ memo-agent/
 │   │   └── StatusBar.tsx         # 底部状态栏
 │   └── types/
 │       ├── messages.ts           # ChatMessage、StreamEvent
-│       ├── config.ts             # SlaveAgentConfig
-│       ├── errors.ts             # SlaveAgentError 判别联合
+│       ├── config.ts             # MemoAgentConfig
+│       ├── errors.ts             # MemoAgentError 判别联合
 │       ├── tool.ts               # Tool 接口
 │       └── session.ts            # SessionRow、MessageRow
 ├── .memo-agent/
