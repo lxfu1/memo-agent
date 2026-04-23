@@ -14,8 +14,6 @@
 
 import type Database from "better-sqlite3";
 import type OpenAI from "openai";
-import path from "node:path";
-import { minimatch } from "minimatch";
 import {
   appendMessage,
   createSession,
@@ -26,25 +24,23 @@ import {
   updateSessionStats,
 } from "../session/db.js";
 import { streamChat } from "../model/streaming.js";
-import {
-  buildSystemPrompt,
-  type RecipeDescriptor,
-} from "../context/promptBuilder.js";
+import { type RecipeDescriptor } from "../context/promptBuilder.js";
 import {
   computeBudgetSnapshot,
   estimateCostUsd,
 } from "../context/tokenBudget.js";
 import { compressContext, type CompressorDeps } from "../context/compressor.js";
 import { createNotesManager } from "../memory/notesManager.js";
-import { getTool, getToolsAsOpenAIFunctions } from "../tools/registry.js";
-import { checkPermission, type PermissionRequest } from "../permissions/guard.js";
+import { getToolsAsOpenAIFunctions } from "../tools/registry.js";
+import { type PermissionRequest } from "../permissions/guard.js";
 import { routeCommand, type CommandContext } from "./commandRouter.js";
 import { expandRecipe } from "../recipes/recipeRegistry.js";
 import { clearSessionTasks } from "../tools/tasks.js";
 import type { ChatMessage, OpenAIToolCall, TokenUsage } from "../types/messages.js";
 import type { MemoAgentConfig } from "../types/config.js";
 import type { Recipe } from "../recipes/recipeRegistry.js";
-import type { Tool, ToolContext } from "../types/tool.js";
+import { SystemPromptManager } from "./services/SystemPromptManager.js";
+import { ToolExecutor } from "./services/ToolExecutor.js";
 
 const MAX_TOOL_CALL_ROUNDS = 20;
 
@@ -110,7 +106,6 @@ export class ConversationEngine {
   private totalInputTokens = 0;
   private totalOutputTokens = 0;
   private estimatedCostUsd = 0;
-  // Tracks what has already been flushed to DB to compute per-flush deltas
   private flushedInputTokens = 0;
   private flushedOutputTokens = 0;
   private flushedCostUsd = 0;
@@ -120,20 +115,13 @@ export class ConversationEngine {
   private currentModel: string;
   private abortController: AbortController | null = null;
   private isFirstMessage: boolean;
-  private cachedSystemPrompt: string | null = null;
-  private pendingInjectionWarnings: string[] = [];
 
-  // Pending permission resolutions (request id → resolve callback)
-  private pendingPermissions = new Map<
-    string,
-    (decision: PermissionDecision) => void
-  >();
-
-  // Tools pre-approved by the current recipe invocation
+  private pendingPermissions = new Map<string, (decision: PermissionDecision) => void>();
   private recipeAllowedTools: Set<string> = new Set();
-
-  // Tools the user has approved for the rest of this session via "allow always"
   private sessionAlwaysAllowedTools: Set<string> = new Set();
+
+  private readonly sysPromptManager = new SystemPromptManager();
+  private readonly toolExecutor: ToolExecutor;
 
   constructor(private readonly opts: EngineOptions) {
     this.messages = opts.initialMessages ?? [];
@@ -141,6 +129,33 @@ export class ConversationEngine {
     this.permissionMode = opts.permissionMode ?? opts.config.permissions.mode;
     this.currentModel = opts.config.model.name;
     this.isFirstMessage = this.messages.length === 0;
+
+    this.toolExecutor = new ToolExecutor({
+      cwd: opts.cwd,
+      profileDir: opts.profileDir,
+      db: opts.db,
+      config: opts.config,
+      recipes: opts.recipes,
+      getSessionId: () => this.sessionId,
+      getPermissionMode: () => this.permissionMode,
+      getAbortController: () => this.abortController,
+      getRecipeAllowedTools: () => this.recipeAllowedTools,
+      getSessionAlwaysAllowedTools: () => this.sessionAlwaysAllowedTools,
+      onMessageAppended: (toolCallId, toolName, content, isError) => {
+        const toolMsg: ChatMessage = {
+          role: "tool",
+          content: isError ? `Error: ${content}` : content,
+          tool_call_id: toolCallId,
+          name: toolName,
+        };
+        this.messages = [...this.messages, toolMsg];
+      },
+      onSessionAlwaysAllow: toolName => {
+        this.sessionAlwaysAllowedTools.add(toolName);
+      },
+      onWaitForPermission: requestId => this.waitForPermission(requestId),
+      onInvalidateSystemPrompt: () => this.sysPromptManager.invalidate(),
+    });
 
     if (this.messages.length === 0) {
       createSession(opts.db, {
@@ -159,13 +174,12 @@ export class ConversationEngine {
   updateConfig(newConfig: MemoAgentConfig): void {
     this.opts.config = newConfig;
     this.currentModel = newConfig.model.name;
-    this.invalidateSystemPrompt();
+    this.sysPromptManager.invalidate();
   }
 
   /** Interrupts the current streaming operation and resolves all pending permissions as denied */
   interrupt(): void {
     this.abortController?.abort();
-    // Drain pending permissions so their promises don't leak
     for (const [id, resolve] of this.pendingPermissions) {
       this.pendingPermissions.delete(id);
       resolve("deny");
@@ -188,32 +202,6 @@ export class ConversationEngine {
   getMessages(): ChatMessage[] { return this.messages; }
 
   /** Resolves a pending permission request */
-  /** Clears the cached system prompt so it is rebuilt on the next turn */
-  private invalidateSystemPrompt(): void {
-    this.cachedSystemPrompt = null;
-  }
-
-  /** Returns the cached system prompt, building it if necessary */
-  private async getOrBuildSystemPrompt(): Promise<string> {
-    if (!this.cachedSystemPrompt) {
-      const recipeDescriptors: RecipeDescriptor[] = this.opts.recipes.map(r => ({
-        name: r.name,
-        description: r.description,
-        scope: r.scope,
-      }));
-      const result = await buildSystemPrompt({
-        cwd: this.opts.cwd,
-        profileDir: this.opts.profileDir,
-        config: this.opts.config,
-        recipes: recipeDescriptors,
-      });
-      this.cachedSystemPrompt = result.prompt;
-      // Emit injection warnings via the event stream on the next turn
-      this.pendingInjectionWarnings = result.injectionWarnings;
-    }
-    return this.cachedSystemPrompt;
-  }
-
   resolvePermission(requestId: string, decision: PermissionDecision): void {
     const resolve = this.pendingPermissions.get(requestId);
     if (resolve) {
@@ -230,41 +218,31 @@ export class ConversationEngine {
     const trimmed = userInput.trim();
     if (!trimmed) return;
 
-    // Determine actual message body: recipe expansion, command, or plain text.
-    // Recipe check must come BEFORE the slash-command branch so that
-    // recipe-invoked tools get their allowedTools pre-approval.
     let messageBody = trimmed;
     let markerText: string | null = null;
     this.recipeAllowedTools = new Set();
 
     if (trimmed.startsWith("/")) {
-      // Try recipe expansion first
       const expansion = expandRecipe(this.opts.recipes, trimmed);
       if (expansion) {
         messageBody = expansion.bodyText;
         markerText = expansion.markerText;
         this.recipeAllowedTools = new Set(expansion.allowedTools);
       } else if (this.isBuiltinCommand(trimmed)) {
-        // Known slash command — delegate to command handler and return
         yield* this.handleCommand(trimmed);
         return;
       } else {
-        // Unknown /command — let the command handler emit an error
         yield* this.handleCommand(trimmed);
         return;
       }
     }
 
-    // Build (or retrieve cached) system prompt
-    const systemPrompt = await this.getOrBuildSystemPrompt();
+    const systemPrompt = await this.sysPromptManager.get(this.buildPromptOptions());
 
-    // Flush any injection warnings produced during prompt build
-    for (const source of this.pendingInjectionWarnings) {
+    for (const source of this.sysPromptManager.drainWarnings()) {
       yield { type: "injection_warning", source };
     }
-    this.pendingInjectionWarnings = [];
 
-    // Check token budget and maybe compress
     const snapshot = computeBudgetSnapshot(
       this.messages,
       systemPrompt,
@@ -275,14 +253,9 @@ export class ConversationEngine {
     if (snapshot.isAboveCompress) {
       yield* this.performCompression(systemPrompt, "auto");
     } else if (snapshot.isAboveWarn) {
-      yield {
-        type: "token_warning",
-        ratio: snapshot.usageRatio,
-        level: "warn",
-      };
+      yield { type: "token_warning", ratio: snapshot.usageRatio, level: "warn" };
     }
 
-    // Append user message (immutable pattern)
     const userMessage: ChatMessage = {
       role: "user",
       content: markerText ? `${markerText}\n\n${messageBody}` : messageBody,
@@ -299,26 +272,20 @@ export class ConversationEngine {
       tokenCount: 0,
     });
 
-    // Set session title from first message
     if (this.isFirstMessage) {
       this.isFirstMessage = false;
-      const title = trimmed.slice(0, 80);
-      setSessionTitle(this.opts.db, this.sessionId, title);
+      setSessionTitle(this.opts.db, this.sessionId, trimmed.slice(0, 80));
     }
 
-    // Notify UI of updated messages and initial token ratio
     yield { type: "messages_updated", messages: this.messages };
     yield this.buildUsageEvent(systemPrompt);
 
-    // Run the tool call loop
     yield* this.runToolCallLoop(systemPrompt);
 
-    // Auto-update NOTES.md after every complete turn
     if (this.opts.config.memory.autoUpdate) {
       yield* this.autoUpdateNotes();
     }
 
-    // Prune old sessions on every turn (cheap SQL, prevents unbounded DB growth)
     pruneOldSessions(this.opts.db);
   }
 
@@ -330,7 +297,6 @@ export class ConversationEngine {
     this.abortController = new AbortController();
     let rounds = 0;
 
-    // Tool definitions don't change within a single conversation turn.
     const toolDefs = getToolsAsOpenAIFunctions();
 
     while (rounds < MAX_TOOL_CALL_ROUNDS) {
@@ -361,7 +327,6 @@ export class ConversationEngine {
             break;
 
           case "tool_call_delta":
-            // No event emitted — accumulation is internal to streaming layer
             break;
 
           case "tool_call_done":
@@ -381,24 +346,18 @@ export class ConversationEngine {
             break;
 
           case "error":
-            yield {
-              type: "error",
-              message: event.error.message,
-              code: event.error.code,
-            };
+            yield { type: "error", message: event.error.message, code: event.error.code };
             return;
         }
       }
 
       if (!streamDone) break;
 
-      // Update cumulative totals with per-turn deltas
       const turnCost = estimateCostUsd(turnUsage, this.currentModel);
       this.totalInputTokens += turnUsage.promptTokens;
       this.totalOutputTokens += turnUsage.completionTokens;
       this.estimatedCostUsd += turnCost;
 
-      // Persist assistant message
       const assistantMessage: ChatMessage = {
         role: "assistant",
         content: assistantContent || null,
@@ -419,13 +378,11 @@ export class ConversationEngine {
       yield { type: "messages_updated", messages: this.messages };
       yield this.buildUsageEvent(systemPrompt);
 
-      // Handle tool calls — read-only batches run in parallel, others serially.
       if (stopReason === "tool_calls" && accumulatedToolCalls.length > 0) {
-        yield* this.executeToolCalls(accumulatedToolCalls);
-        continue; // Continue loop to send tool results back to model
+        yield* this.toolExecutor.executeAll(accumulatedToolCalls);
+        continue;
       }
 
-      // Normal stop
       break;
     }
 
@@ -437,8 +394,6 @@ export class ConversationEngine {
       };
     }
 
-    // Persist session stats: the engine tracks cumulative totals, but the DB uses additive
-    // increments. We track what was already flushed to avoid double-counting.
     const newInput = this.totalInputTokens - this.flushedInputTokens;
     const newOutput = this.totalOutputTokens - this.flushedOutputTokens;
     const newCost = this.estimatedCostUsd - this.flushedCostUsd;
@@ -451,11 +406,9 @@ export class ConversationEngine {
     this.flushedOutputTokens = this.totalOutputTokens;
     this.flushedCostUsd = this.estimatedCostUsd;
 
-    // Final token budget check
-    const finalSystemPrompt = systemPrompt;
     const finalSnapshot = computeBudgetSnapshot(
       this.messages,
-      finalSystemPrompt,
+      systemPrompt,
       this.opts.config.context,
       this.currentModel
     );
@@ -467,302 +420,6 @@ export class ConversationEngine {
         level: finalSnapshot.isAboveCompress ? "critical" : "warn",
       };
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Tool execution — dispatcher
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Executes a batch of tool calls, choosing the optimal strategy:
-   *
-   * • All tools read-only  →  parallel (Promise.allSettled)
-   *   Read-only tools have no filesystem side-effects, always receive
-   *   auto-approved permissions, and are independent of each other.
-   *   Running them concurrently removes the serial IO wait time entirely.
-   *
-   * • Any write tool present  →  serial (original behaviour)
-   *   Write tools may: require user confirmation dialogs, invalidate the
-   *   system-prompt cache, trigger watchPaths suggestions, or depend on
-   *   the output of a previous tool in the same batch.
-   *
-   * Message ordering is always preserved: results are appended to
-   * this.messages in the original toolCall index order regardless of which
-   * tool finished first.
-   */
-  private async *executeToolCalls(
-    toolCalls: OpenAIToolCall[],
-  ): AsyncGenerator<EngineEvent, void, unknown> {
-    // ── Decide strategy ──────────────────────────────────────────────────────
-    const canParallelize =
-      toolCalls.length > 1 &&
-      toolCalls.every(tc => getTool(tc.function.name)?.isReadOnly() === true);
-
-    if (!canParallelize) {
-      for (const toolCall of toolCalls) {
-        yield* this.executeToolCall(toolCall);
-      }
-      return;
-    }
-
-    // ── Parallel path ────────────────────────────────────────────────────────
-
-    // Discriminated union for per-call preparation result
-    type PreparedOk = {
-      ok: true;
-      toolCall: OpenAIToolCall;
-      tool: Tool;
-      input: Record<string, unknown>;
-    };
-    type PreparedErr = {
-      ok: false;
-      toolCall: OpenAIToolCall;
-      error: string;
-    };
-    type Prepared = PreparedOk | PreparedErr;
-
-    // Step 1 — parse inputs and check permissions synchronously.
-    // Read-only tools always receive "allow" (unless explicitly denied),
-    // so no async user interaction is needed here.
-    const prepared: Prepared[] = toolCalls.map((toolCall): Prepared => {
-      const tool = getTool(toolCall.function.name);
-      if (!tool) {
-        return { ok: false, toolCall, error: `Tool "${toolCall.function.name}" not found` };
-      }
-
-      let input: Record<string, unknown>;
-      try {
-        input = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
-      } catch {
-        return { ok: false, toolCall, error: `Invalid JSON arguments for tool "${toolCall.function.name}"` };
-      }
-
-      const isPreApproved =
-        this.recipeAllowedTools.has(toolCall.function.name) ||
-        this.sessionAlwaysAllowedTools.has(toolCall.function.name);
-      const effectiveMode = isPreApproved ? "auto" : this.permissionMode;
-      const permResult = checkPermission(tool, input, effectiveMode, this.opts.config.permissions, this.opts.cwd);
-
-      if (permResult.behavior === "deny") {
-        return { ok: false, toolCall, error: `Permission denied: ${permResult.reason}` };
-      }
-      // "ask" should never occur for read-only tools, but guard defensively.
-      if (permResult.behavior === "ask") {
-        return { ok: false, toolCall, error: `Unexpected permission prompt for read-only tool "${toolCall.function.name}"` };
-      }
-
-      return { ok: true, toolCall, tool, input };
-    });
-
-    // Step 2 — emit description events for all tools up-front so the UI
-    // shows every card in "running" state before any of them finish.
-    for (const p of prepared) {
-      if (p.ok) {
-        yield {
-          type: "tool_call_description",
-          id: p.toolCall.id,
-          description: buildToolDescription(p.toolCall.function.name, p.input),
-        };
-      }
-    }
-
-    // Step 3 — execute all prepared tools concurrently.
-    const toolCtx: ToolContext = {
-      cwd: this.opts.cwd,
-      profileDir: this.opts.profileDir,
-      sessionId: this.sessionId,
-      permissionMode: this.permissionMode,
-      db: this.opts.db,
-      ...(this.abortController && { abortSignal: this.abortController.signal }),
-    };
-
-    const execResults = await Promise.allSettled(
-      prepared.map(p =>
-        p.ok
-          ? p.tool.call(p.input, toolCtx)
-          : Promise.resolve({ content: p.error, isError: true as const }),
-      ),
-    );
-
-    // Step 4 — emit results in the original call order and update messages.
-    // Preserving order is required so this.messages stays consistent with
-    // the assistant's tool_calls array (matched by tool_call_id).
-    for (let i = 0; i < prepared.length; i++) {
-      const p = prepared[i]!;
-      const execResult = execResults[i]!;
-      const toolName = p.toolCall.function.name;
-      const toolId = p.toolCall.id;
-
-      let content: string;
-      let isError: boolean;
-
-      if (execResult.status === "rejected") {
-        content = `Tool execution error: ${execResult.reason instanceof Error ? execResult.reason.message : String(execResult.reason)}`;
-        isError = true;
-      } else {
-        const raw = execResult.value;
-        isError = raw.isError ?? false;
-        // Truncate oversized results (mirrors the sequential path).
-        const maxChars = p.ok ? p.tool.maxResultChars : raw.content.length;
-        content = raw.content.length > maxChars
-          ? raw.content.slice(0, maxChars) + "\n...(truncated)"
-          : raw.content;
-      }
-
-      this.appendToolResult(toolId, toolName, content, isError);
-      yield { type: "tool_result", name: toolName, id: toolId, content, isError };
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Tool execution — single call
-  // ---------------------------------------------------------------------------
-
-  private async *executeToolCall(
-    toolCall: OpenAIToolCall
-  ): AsyncGenerator<EngineEvent, void, unknown> {
-    const toolName = toolCall.function.name;
-    const tool = getTool(toolName);
-
-    if (!tool) {
-      const errorResult = `Tool "${toolName}" not found`;
-      this.appendToolResult(toolCall.id, toolName, errorResult, true);
-      yield { type: "tool_result", name: toolName, id: toolCall.id, content: errorResult, isError: true };
-      return;
-    }
-
-    let input: Record<string, unknown>;
-    try {
-      input = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
-    } catch {
-      const errorResult = `Invalid JSON arguments for tool "${toolName}"`;
-      this.appendToolResult(toolCall.id, toolName, errorResult, true);
-      yield { type: "tool_result", name: toolName, id: toolCall.id, content: errorResult, isError: true };
-      return;
-    }
-
-    // Permission check
-    const isPreApproved = this.recipeAllowedTools.has(toolName) || this.sessionAlwaysAllowedTools.has(toolName);
-    const effectiveMode = isPreApproved ? "auto" : this.permissionMode;
-
-    const permResult = checkPermission(tool, input, effectiveMode, this.opts.config.permissions, this.opts.cwd);
-
-    if (permResult.behavior === "deny") {
-      const errorResult = `Permission denied: ${permResult.reason}`;
-      this.appendToolResult(toolCall.id, toolName, errorResult, true);
-      yield { type: "tool_result", name: toolName, id: toolCall.id, content: errorResult, isError: true };
-      return;
-    }
-
-    if (permResult.behavior === "ask") {
-      yield { type: "permission_request", request: permResult.request };
-
-      const decision = await this.waitForPermission(permResult.request.id);
-
-      if (decision === "deny") {
-        const errorResult = "User denied permission";
-        this.appendToolResult(toolCall.id, toolName, errorResult, true);
-        yield { type: "tool_result", name: toolName, id: toolCall.id, content: errorResult, isError: true };
-        return;
-      }
-
-      if (decision === "allow_always") {
-        this.sessionAlwaysAllowedTools.add(toolName);
-      }
-    }
-
-    // Execute tool
-    const toolCtx: ToolContext = {
-      cwd: this.opts.cwd,
-      profileDir: this.opts.profileDir,
-      sessionId: this.sessionId,
-      permissionMode: this.permissionMode,
-      db: this.opts.db,
-      ...(this.abortController && { abortSignal: this.abortController.signal }),
-    };
-
-    // Emit a description so the UI can show "⟳ ReadFile src/main.ts" while
-    // the tool is running, instead of just the bare tool name.
-    yield { type: "tool_call_description", id: toolCall.id, description: buildToolDescription(toolName, input) };
-
-    let result;
-    try {
-      result = await tool.call(input, toolCtx);
-    } catch (err) {
-      const errorResult = `Tool execution error: ${err instanceof Error ? err.message : String(err)}`;
-      this.appendToolResult(toolCall.id, toolName, errorResult, true);
-      yield { type: "tool_result", name: toolName, id: toolCall.id, content: errorResult, isError: true };
-      return;
-    }
-
-    // Writing to NOTES.md or project files changes what the system prompt injects
-    const FILE_MUTATING_TOOLS = new Set(["WriteFile", "EditFile", "WriteNotes"]);
-    if (FILE_MUTATING_TOOLS.has(toolName)) {
-      this.invalidateSystemPrompt();
-    }
-
-    // After a successful file write, check recipe watchPaths and suggest matches
-    if (!result.isError && (toolName === "WriteFile" || toolName === "EditFile")) {
-      const writtenPath = input["path"] as string | undefined;
-      if (writtenPath) {
-        yield* this.checkWatchPaths(writtenPath);
-      }
-    }
-
-    // Truncate oversized results
-    const maxChars = tool.maxResultChars;
-    const content = result.content.length > maxChars
-      ? result.content.slice(0, maxChars) + "\n...(truncated)"
-      : result.content;
-
-    this.appendToolResult(toolCall.id, toolName, content, result.isError ?? false);
-    yield {
-      type: "tool_result",
-      name: toolName,
-      id: toolCall.id,
-      content,
-      isError: result.isError ?? false,
-    };
-  }
-
-  private appendToolResult(
-    toolCallId: string,
-    toolName: string,
-    content: string,
-    isError: boolean
-  ): void {
-    const toolMsg: ChatMessage = {
-      role: "tool",
-      content: isError ? `Error: ${content}` : content,
-      tool_call_id: toolCallId,
-      name: toolName,
-    };
-    this.messages = [...this.messages, toolMsg];
-
-    appendMessage(this.opts.db, {
-      sessionId: this.sessionId,
-      role: "tool",
-      content: toolMsg.content,
-      toolCallsJson: null,
-      toolCallId,
-      tokenCount: 0,
-    });
-  }
-
-  private waitForPermission(requestId: string): Promise<PermissionDecision> {
-    return new Promise(resolve => {
-      // Auto-deny after 30 s so a missed UI event never hangs the tool loop.
-      const timeout = setTimeout(() => {
-        if (this.pendingPermissions.delete(requestId)) {
-          resolve("deny");
-        }
-      }, 30_000);
-
-      this.pendingPermissions.set(requestId, (decision: PermissionDecision) => {
-        clearTimeout(timeout);
-        resolve(decision);
-      });
-    });
   }
 
   // ---------------------------------------------------------------------------
@@ -783,16 +440,9 @@ export class ConversationEngine {
     };
 
     try {
-      const result = await compressContext(
-        this.messages,
-        systemPrompt,
-        focus,
-        compressorDeps
-      );
+      const result = await compressContext(this.messages, systemPrompt, focus, compressorDeps);
 
       if (result.summary) {
-        // Create a new session that chains from the current one so the full
-        // pre-compression history is permanently retrievable via parent_session_id.
         const archivedSessionId = this.sessionId;
         const newSessionId = crypto.randomUUID();
 
@@ -801,14 +451,11 @@ export class ConversationEngine {
           title: `[compressed] ${new Date().toISOString().slice(0, 10)}`,
           model: this.currentModel,
           parentSessionId: archivedSessionId,
-          // Carry forward accumulated token stats so /cost and history
-          // reflect the true lifetime cost of this conversation chain.
           inputTokens: this.totalInputTokens,
           outputTokens: this.totalOutputTokens,
           estimatedCostUsd: this.estimatedCostUsd,
         });
 
-        // Persist the compressed messages under the new session
         for (const msg of result.messages) {
           appendMessage(this.opts.db, {
             sessionId: newSessionId,
@@ -821,8 +468,6 @@ export class ConversationEngine {
         }
 
         this.sessionId = newSessionId;
-        // Sync flushed counters so the next updateSessionStats call does not
-        // double-count tokens that were already written to the new session row.
         this.flushedInputTokens = this.totalInputTokens;
         this.flushedOutputTokens = this.totalOutputTokens;
         this.flushedCostUsd = this.estimatedCostUsd;
@@ -872,7 +517,7 @@ export class ConversationEngine {
         this.messages = [];
         this.isFirstMessage = true;
         this.sessionId = crypto.randomUUID();
-        this.invalidateSystemPrompt();
+        this.sysPromptManager.invalidate();
         createSession(this.opts.db, {
           id: this.sessionId,
           title: "",
@@ -886,7 +531,7 @@ export class ConversationEngine {
         break;
 
       case "compact": {
-        const systemPrompt = await this.getOrBuildSystemPrompt();
+        const systemPrompt = await this.sysPromptManager.get(this.buildPromptOptions());
         yield* this.performCompression(systemPrompt, "manual", result.focus);
         break;
       }
@@ -907,20 +552,12 @@ export class ConversationEngine {
 
       case "switch_mode":
         this.permissionMode = result.mode;
-        yield {
-          type: "command_output",
-          message: `Permission mode switched to: ${result.mode}`,
-          kind: "info",
-        };
+        yield { type: "command_output", message: `Permission mode switched to: ${result.mode}`, kind: "info" };
         break;
 
       case "switch_model":
         this.currentModel = result.name;
-        yield {
-          type: "command_output",
-          message: `Model switched to: ${result.name}`,
-          kind: "info",
-        };
+        yield { type: "command_output", message: `Model switched to: ${result.name}`, kind: "info" };
         break;
 
       case "resume": {
@@ -942,7 +579,7 @@ export class ConversationEngine {
         this.messages = rowsToChatMessages(rows);
         this.sessionId = targetId;
         this.isFirstMessage = false;
-        this.invalidateSystemPrompt();
+        this.sysPromptManager.invalidate();
         yield { type: "messages_updated", messages: this.messages };
         yield {
           type: "command_output",
@@ -985,48 +622,10 @@ export class ConversationEngine {
   }
 
   // ---------------------------------------------------------------------------
-  // Recipe watchPaths
-  // ---------------------------------------------------------------------------
-
-  /**
-   * After a file is written, check whether any recipe declares a watchPaths
-   * pattern that matches. Emit a suggestion notice for each matching recipe.
-   * The path is normalised to a relative form for glob matching.
-   */
-  private *checkWatchPaths(writtenPath: string): Generator<EngineEvent> {
-    const relPath = path.isAbsolute(writtenPath)
-      ? path.relative(this.opts.cwd, writtenPath)
-      : writtenPath;
-
-    // Normalise Windows-style separators just in case
-    const normalised = relPath.split(path.sep).join("/");
-
-    for (const recipe of this.opts.recipes) {
-      const patterns = recipe.frontmatter.watchPaths ?? [];
-      const matches = patterns.some(pattern => minimatch(normalised, pattern, { dot: true }));
-      if (matches) {
-        yield {
-          type: "command_output",
-          message: `Tip: /${recipe.name} may be relevant — ${recipe.description}`,
-          kind: "info",
-        };
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
   // NOTES.md auto-update
   // ---------------------------------------------------------------------------
 
-  /**
-   * After each complete turn, asks a lightweight model to identify any facts
-   * worth persisting to NOTES.md. Responds either with a note to append or
-   * the literal string "SKIP" when nothing is worth saving.
-   *
-   * Uses the auxiliary model when available to reduce cost.
-   */
   private async *autoUpdateNotes(): AsyncGenerator<EngineEvent, void, unknown> {
-    // Only consider the last user+assistant exchange to keep the prompt small
     const recentMessages = this.getLastTurnMessages();
     if (recentMessages.length === 0) return;
 
@@ -1052,17 +651,15 @@ Rules:
 - Do not repeat information already obvious from the conversation.
 - Write in past tense. No preamble — just the note content, or SKIP.`;
 
-    const userContent = `Conversation turn:\n\n${turnText}`;
-
     let noteText = "";
     for await (const event of streamChat(client, {
       model,
-      messages: [{ role: "user", content: userContent }],
+      messages: [{ role: "user", content: `Conversation turn:\n\n${turnText}` }],
       systemPrompt,
       maxTokens: 256,
     })) {
       if (event.type === "text_delta") noteText += event.delta;
-      if (event.type === "error") return; // silently skip on error
+      if (event.type === "error") return;
     }
 
     noteText = noteText.trim();
@@ -1071,13 +668,9 @@ Rules:
     try {
       const manager = createNotesManager(this.opts.profileDir);
       await manager.append(noteText);
-      this.invalidateSystemPrompt();
-      // Reuse notes_shown to surface the written note in the UI so the user
-      // knows what was persisted (same event the /notes show command uses).
+      this.sysPromptManager.invalidate();
       yield { type: "notes_shown", content: `✎ Auto-saved to NOTES.md:\n\n${noteText}` };
     } catch (err) {
-      // Non-fatal but visible — surface the error so the user knows
-      // why memory was not updated (e.g. disk full, permission denied).
       yield {
         type: "command_output",
         message: `NOTES.md auto-update failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -1086,14 +679,7 @@ Rules:
     }
   }
 
-  /** Returns the messages from the last user input onward (current turn only) */
   private getLastTurnMessages(): ChatMessage[] {
-    // Walk backwards to find the most recent user message boundary.
-    // We want messages from the LAST user message onward, not the second-to-last.
-    // The previous implementation returned the slice after the second-to-last user
-    // message, which is correct for multi-turn conversations but falls back to the
-    // entire history on the first turn — potentially sending thousands of tokens to
-    // the summarizer. Cap at the last user message instead.
     for (let i = this.messages.length - 1; i >= 0; i--) {
       if (this.messages[i]!.role === "user") {
         return this.messages.slice(i);
@@ -1123,6 +709,35 @@ Rules:
     };
   }
 
+  private buildPromptOptions() {
+    const recipeDescriptors: RecipeDescriptor[] = this.opts.recipes.map(r => ({
+      name: r.name,
+      description: r.description,
+      scope: r.scope,
+    }));
+    return {
+      cwd: this.opts.cwd,
+      profileDir: this.opts.profileDir,
+      config: this.opts.config,
+      recipes: recipeDescriptors,
+    };
+  }
+
+  private waitForPermission(requestId: string): Promise<PermissionDecision> {
+    return new Promise(resolve => {
+      const timeout = setTimeout(() => {
+        if (this.pendingPermissions.delete(requestId)) {
+          resolve("deny");
+        }
+      }, 30_000);
+
+      this.pendingPermissions.set(requestId, (decision: PermissionDecision) => {
+        clearTimeout(timeout);
+        resolve(decision);
+      });
+    });
+  }
+
   /** Restores messages from a previous session */
   static async restoreSession(
     db: Database.Database,
@@ -1133,31 +748,4 @@ Rules:
     const messages = rowsToChatMessages(rows);
     return new ConversationEngine({ ...opts, sessionId, initialMessages: messages });
   }
-}
-
-// ---------------------------------------------------------------------------
-// Module-level helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Produces a one-line human-readable description of a tool invocation.
- * Shown in the ToolCallCard while the tool is running so the user can see
- * what the model is doing (e.g. "src/main.ts" rather than just "ReadFile").
- */
-function buildToolDescription(toolName: string, input: Record<string, unknown>): string {
-  // Generic extraction: pick the most meaningful single-value field.
-  const path    = typeof input["path"]    === "string" ? input["path"]    : null;
-  const command = typeof input["command"] === "string" ? input["command"] : null;
-  const pattern = typeof input["pattern"] === "string" ? input["pattern"] : null;
-  const query   = typeof input["query"]   === "string" ? input["query"]   : null;
-  const content = typeof input["content"] === "string" ? input["content"] : null;
-
-  if (path)    return path;
-  if (command) return command.length > 60 ? command.slice(0, 59) + "…" : command;
-  if (pattern) return pattern.length > 60 ? pattern.slice(0, 59) + "…" : pattern;
-  if (query)   return query.length   > 60 ? query.slice(0, 59)   + "…" : query;
-  // WriteNotes / ReadNotes
-  if (toolName === "WriteNotes" && content) return content.slice(0, 60) + (content.length > 60 ? "…" : "");
-  if (toolName === "ReadNotes")  return "NOTES.md";
-  return "";
 }
