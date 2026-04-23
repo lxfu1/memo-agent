@@ -27,7 +27,45 @@ memo-agent is a terminal-based AI assistant application (Hermes Agent simplified
 
 ---
 
-## Quick Start
+## Installation
+
+### Via npm (recommended)
+
+```bash
+npm install -g memo-agent
+```
+
+Then configure your API key (choose one method):
+
+**Option A — Environment variable:**
+```bash
+export MODEL_API_KEY=sk-...
+export MODEL_BASE_URL=https://api.openai.com/v1   # optional, defaults to OpenAI
+export MODEL_NAME=gpt-4o                           # optional, defaults to gpt-4o
+memo
+```
+
+**Option B — Config file:**
+```bash
+mkdir -p ~/.memo-agent
+cat > ~/.memo-agent/config.yaml << 'EOF'
+model:
+  base_url: "https://api.openai.com/v1"
+  api_key: "sk-..."
+  name: gpt-4o
+EOF
+memo
+```
+
+### Via npx (no install)
+
+```bash
+MODEL_API_KEY=sk-... npx memo-agent
+```
+
+---
+
+## Quick Start (from source)
 
 ### Install Dependencies
 
@@ -61,7 +99,7 @@ npm run dev
 npm run build
 npm start
 
-# Global installation to use the `memo` command
+# Global installation from source
 npm install -g .
 memo
 ```
