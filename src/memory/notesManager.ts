@@ -110,6 +110,6 @@ function tokenize(text: string): Set<string> {
     text
       .toLowerCase()
       .split(/\W+/)
-      .filter(w => w.length > 3)
+      .filter(w => w.length > 1)
   );
 }

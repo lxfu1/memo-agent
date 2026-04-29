@@ -12,7 +12,7 @@
  *   8 tokens  — per tool_call block (type, id, function wrapper)
  */
 
-import { encode } from "gpt-tokenizer";
+import { encode, decode } from "gpt-tokenizer";
 import type { ChatMessage, TokenUsage } from "../types/messages.js";
 import type { ContextConfig } from "../types/config.js";
 
@@ -48,7 +48,14 @@ const CONTEXT_WINDOW_SIZES: Record<string, number> = {
   "o1-mini":             128_000,
   "o3":                  200_000,
   "o3-mini":             200_000,
+  // Claude 4
+  "claude-opus-4":       200_000,
+  "claude-sonnet-4":     200_000,
+  "claude-haiku-4":      200_000,
+  // Claude 3.5
   "claude-3-5-sonnet":   200_000,
+  "claude-3-5-haiku":    200_000,
+  // Claude 3
   "claude-3-opus":       200_000,
   "claude-3-haiku":      200_000,
 };
@@ -171,12 +178,23 @@ export function computeBudgetSnapshot(
 export function estimateCostUsd(usage: TokenUsage, modelName: string): number {
   // Prices in USD per 1 M tokens (input / output), as of mid-2025.
   const costs: Record<string, { input: number; output: number }> = {
-    "gpt-4o":          { input: 2.5,  output: 10  },
-    "gpt-4o-mini":     { input: 0.15, output: 0.6 },
-    "gpt-4-turbo":     { input: 10,   output: 30  },
-    "gpt-3.5-turbo":   { input: 0.5,  output: 1.5 },
-    "o1":              { input: 15,   output: 60  },
-    "o3-mini":         { input: 1.1,  output: 4.4 },
+    // OpenAI
+    "gpt-4o":            { input: 2.5,  output: 10   },
+    "gpt-4o-mini":       { input: 0.15, output: 0.6  },
+    "gpt-4-turbo":       { input: 10,   output: 30   },
+    "gpt-3.5-turbo":     { input: 0.5,  output: 1.5  },
+    "o1":                { input: 15,   output: 60   },
+    "o3-mini":           { input: 1.1,  output: 4.4  },
+    // Claude 4
+    "claude-opus-4":     { input: 15,   output: 75   },
+    "claude-sonnet-4":   { input: 3,    output: 15   },
+    "claude-haiku-4":    { input: 0.8,  output: 4    },
+    // Claude 3.5
+    "claude-3-5-sonnet": { input: 3,    output: 15   },
+    "claude-3-5-haiku":  { input: 0.8,  output: 4    },
+    // Claude 3
+    "claude-3-opus":     { input: 15,   output: 75   },
+    "claude-3-haiku":    { input: 0.25, output: 1.25 },
   };
 
   // Sort by key length descending so "gpt-4o-mini" is tested before "gpt-4o".
@@ -186,4 +204,15 @@ export function estimateCostUsd(usage: TokenUsage, modelName: string): number {
   const rate = costKey ? costs[costKey]! : { input: 2.5, output: 10 };
 
   return (usage.promptTokens * rate.input + usage.completionTokens * rate.output) / 1_000_000;
+}
+
+/**
+ * Truncates `text` to at most `maxTokens` BPE tokens, appending a truncation
+ * marker when content is cut. Uses the same cl100k_base tokenizer as the rest
+ * of the budget system — no 4-chars-per-token approximation.
+ */
+export function truncateToTokenBudget(text: string, maxTokens: number): string {
+  const tokens = encode(text);
+  if (tokens.length <= maxTokens) return text;
+  return decode(tokens.slice(0, maxTokens)) + "\n...(truncated)";
 }

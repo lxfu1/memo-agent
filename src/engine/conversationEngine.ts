@@ -24,7 +24,7 @@ import {
   updateSessionStats,
 } from "../session/db.js";
 import { streamChat } from "../model/streaming.js";
-import { type RecipeDescriptor } from "../context/promptBuilder.js";
+import { type RecipeDescriptor, scanForInjection } from "../context/promptBuilder.js";
 import {
   computeBudgetSnapshot,
   estimateCostUsd,
@@ -117,6 +117,7 @@ export class ConversationEngine {
   private isFirstMessage: boolean;
 
   private pendingPermissions = new Map<string, (decision: PermissionDecision) => void>();
+  private pendingEvents: EngineEvent[] = [];
   private recipeAllowedTools: Set<string> = new Set();
   private sessionAlwaysAllowedTools: Set<string> = new Set();
 
@@ -168,6 +169,8 @@ export class ConversationEngine {
         estimatedCostUsd: 0,
       });
     }
+
+    pruneOldSessions(opts.db);
   }
 
   /** Updates the active config (e.g. after a hot-reload) and invalidates the system prompt cache */
@@ -217,6 +220,12 @@ export class ConversationEngine {
   async *submitMessage(userInput: string): AsyncGenerator<EngineEvent, void, unknown> {
     const trimmed = userInput.trim();
     if (!trimmed) return;
+
+    // Drain events queued by background operations (e.g. notes auto-update from
+    // the previous turn). Yielded here so the UI sees them before the new turn.
+    for (const event of this.pendingEvents.splice(0)) {
+      yield event;
+    }
 
     let messageBody = trimmed;
     let markerText: string | null = null;
@@ -280,10 +289,11 @@ export class ConversationEngine {
     yield* this.runToolCallLoop(systemPrompt);
 
     if (this.opts.config.memory.autoUpdate) {
-      yield* this.autoUpdateNotes();
+      // Fire-and-forget: runs after the response is delivered to the user.
+      // Any events it produces are queued in pendingEvents and yielded at the
+      // start of the next submitMessage call, so the UI isn't blocked.
+      void this.autoUpdateNotes();
     }
-
-    pruneOldSessions(this.opts.db);
   }
 
   // ---------------------------------------------------------------------------
@@ -609,10 +619,10 @@ export class ConversationEngine {
   }
 
   // ---------------------------------------------------------------------------
-  // NOTES.md auto-update
+  // NOTES.md auto-update (fire-and-forget)
   // ---------------------------------------------------------------------------
 
-  private async *autoUpdateNotes(): AsyncGenerator<EngineEvent, void, unknown> {
+  private async autoUpdateNotes(): Promise<void> {
     const recentMessages = this.getLastTurnMessages();
     if (recentMessages.length === 0) return;
 
@@ -661,13 +671,12 @@ Rules:
 
     // Security: scan LLM output before persisting — the model's output is itself
     // an injection vector if the conversation processed attacker-controlled content.
-    const { scanForInjection } = await import("../context/promptBuilder.js");
     if (scanForInjection(noteText)) {
-      yield {
+      this.pendingEvents.push({
         type: "command_output",
         message: "NOTES.md auto-update blocked: potential injection pattern detected in generated note.",
         kind: "error",
-      };
+      });
       return;
     }
 
@@ -676,13 +685,13 @@ Rules:
       const written = await manager.append(noteText);
       if (!written) return; // skipped as duplicate — no notification needed
       this.sysPromptManager.invalidate();
-      yield { type: "notes_shown", content: `✎ Auto-saved to NOTES.md:\n\n${noteText}` };
+      this.pendingEvents.push({ type: "notes_shown", content: `✎ Auto-saved to NOTES.md:\n\n${noteText}` });
     } catch (err) {
-      yield {
+      this.pendingEvents.push({
         type: "command_output",
         message: `NOTES.md auto-update failed: ${err instanceof Error ? err.message : String(err)}`,
         kind: "error",
-      };
+      });
     }
   }
 

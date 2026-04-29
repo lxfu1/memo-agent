@@ -15,7 +15,7 @@ import os from "node:os";
 import { createNotesManager } from "../memory/notesManager.js";
 import { readProfile } from "../memory/profileReader.js";
 import type { MemoAgentConfig } from "../types/config.js";
-import { estimateStringTokens } from "./tokenBudget.js";
+import { estimateStringTokens, truncateToTokenBudget } from "./tokenBudget.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -198,9 +198,7 @@ async function loadNotesContent(
 
   if (scanForInjection(raw)) return "INJECTION_DETECTED";
 
-  // Truncate to maxInjectTokens
-  const maxChars = maxInjectTokens * 4; // ~4 chars per token
-  return raw.length > maxChars ? raw.slice(0, maxChars) + "\n...(truncated)" : raw;
+  return truncateToTokenBudget(raw, maxInjectTokens);
 }
 
 async function loadProfileContent(profileDir: string): Promise<string | null> {

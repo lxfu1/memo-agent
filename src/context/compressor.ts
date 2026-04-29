@@ -154,7 +154,19 @@ function computeZoneBoundaries(
     tailStart = i;
   }
 
-  return { headEnd, tailStart: Math.max(headEnd, tailStart) };
+  // Snap tailStart forward to the nearest user message so that the summary
+  // (injected as a user message) maintains valid role-alternation with the
+  // TAIL. If tailStart lands mid-tool-loop (e.g. on a tool result message),
+  // the API would reject the sequence: user(summary) → tool → ...
+  let snapped = tailStart;
+  while (snapped < messages.length && messages[snapped]!.role !== "user") {
+    snapped++;
+  }
+  // If no user message found beyond tailStart, fall back to the original
+  // boundary (the MIDDLE will be slightly larger but the sequence stays valid).
+  const resolvedTailStart = snapped < messages.length ? snapped : tailStart;
+
+  return { headEnd, tailStart: Math.max(headEnd, resolvedTailStart) };
 }
 
 // ---------------------------------------------------------------------------
