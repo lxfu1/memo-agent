@@ -32,3 +32,19 @@ export interface MessageRow {
 export interface SearchResultRow extends MessageRow {
   sessionTitle: string;
 }
+
+export type TaskStatus = "pending" | "in_progress" | "completed";
+
+export interface TaskRow {
+  id: string;
+  sessionId: string;
+  subject: string;
+  description: string;
+  status: TaskStatus;
+  /** JSON-encoded string[] of blocked-by task IDs */
+  blockedBy: string;
+  /** JSON-encoded string[] of blocking task IDs */
+  blocks: string;
+  createdAt: string;
+  updatedAt: string;
+}

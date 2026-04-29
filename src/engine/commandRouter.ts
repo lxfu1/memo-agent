@@ -20,6 +20,7 @@ export type CommandResult =
   | { type: 'switch_model'; name: string }
   | { type: 'show_notes' }
   | { type: 'clear_notes' }
+  | { type: 'agent_plan'; goal: string }
   | { type: 'unknown'; command: string };
 
 export interface CommandContext {
@@ -38,6 +39,7 @@ const HELP_TEXT = `
 Memo Agent — available commands:
 
   /help                    Show this help
+  /plan <goal>             Run Plan→Execute→Reflect agent loop for a goal
   /notes [show|clear]      View or clear persistent memory (NOTES.md)
   /history [n]             Show recent n sessions (default: 10)
   /search <query>          Full-text search across all message history
@@ -77,6 +79,9 @@ export function routeCommand(
 
     case 'notes':
       return handleNotesCommand(args);
+
+    case 'plan':
+      return handlePlanCommand(args);
 
     case 'history':
       return handleHistoryCommand(args, ctx);
@@ -121,6 +126,14 @@ export function routeCommand(
 // ---------------------------------------------------------------------------
 // Per-command handlers
 // ---------------------------------------------------------------------------
+
+function handlePlanCommand(args: string): CommandResult {
+  const goal = args.trim();
+  if (!goal) {
+    return { type: 'output', message: 'Usage: /plan <goal>\n\nExample: /plan implement user authentication with JWT', kind: 'error' };
+  }
+  return { type: 'agent_plan', goal };
+}
 
 function handleNotesCommand(args: string): CommandResult {
   const sub = args.toLowerCase();

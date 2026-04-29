@@ -1,15 +1,16 @@
 /**
- * In-session task tracking tools.
+ * Persistent task tracking tools.
  *
- * Tasks are stored in memory and scoped to the current session.
- * They are NOT persisted to SQLite — they reset when the session ends.
- * Use WriteNotes for information that should persist across sessions.
+ * Tasks are stored in SQLite and scoped to the current session.
+ * They persist across restarts and are accessible via /resume.
  */
 
 import type { Tool, ToolContext, ToolResult } from "../types/tool.js";
+import type { TaskRow, TaskStatus } from "../types/session.js";
+import { dbCreateTask, dbUpdateTask, dbListTasks, dbGetTask, dbNextTaskId } from "../session/db.js";
 import { registerTool } from "./registry.js";
 
-export type TaskStatus = "pending" | "in_progress" | "completed";
+export type { TaskStatus };
 
 export interface Task {
   id: string;
@@ -19,40 +20,20 @@ export interface Task {
   blockedBy: string[];
   blocks: string[];
   createdAt: string;
+  updatedAt: string;
 }
 
-// Session-scoped in-memory store, keyed by sessionId.
-// Capped at MAX_TASK_SESSIONS entries; oldest sessions are evicted when the
-// cap is exceeded so the process doesn't accumulate unbounded state.
-const taskStore = new Map<string, Map<string, Task>>();
-const MAX_TASK_SESSIONS = 50;
-
-function getSessionTasks(sessionId: string): Map<string, Task> {
-  if (!taskStore.has(sessionId)) {
-    taskStore.set(sessionId, new Map());
-    // Evict oldest session if we exceed the cap (Map preserves insertion order)
-    if (taskStore.size > MAX_TASK_SESSIONS) {
-      const oldest = taskStore.keys().next().value;
-      if (oldest !== undefined) taskStore.delete(oldest);
-    }
-  }
-  return taskStore.get(sessionId) as Map<string, Task>;
-}
-
-/** Removes a session's tasks from memory. Called by the engine on /clear. */
-export function clearSessionTasks(sessionId: string): void {
-  taskStore.delete(sessionId);
-}
-
-// Per-session id counter. Stored alongside tasks so IDs reset on /clear.
-function nextId(tasks: Map<string, Task>): string {
-  // Find the highest numeric id in use and add 1.
-  let max = 0;
-  for (const key of tasks.keys()) {
-    const n = parseInt(key, 10);
-    if (!isNaN(n) && n > max) max = n;
-  }
-  return String(max + 1);
+function rowToTask(row: TaskRow): Task {
+  return {
+    id: row.id,
+    subject: row.subject,
+    description: row.description,
+    status: row.status,
+    blockedBy: JSON.parse(row.blockedBy) as string[],
+    blocks: JSON.parse(row.blocks) as string[],
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -76,19 +57,16 @@ const createTaskTool: Tool = {
   isEnabled(): boolean { return true; },
 
   async call(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-    const tasks = getSessionTasks(ctx.sessionId);
-    const id = nextId(tasks);
-    const task: Task = {
+    const id = dbNextTaskId(ctx.db, ctx.sessionId);
+    dbCreateTask(ctx.db, ctx.sessionId, {
       id,
       subject: input["subject"] as string,
       description: input["description"] as string,
       status: "pending",
-      blockedBy: [],
-      blocks: [],
-      createdAt: new Date().toISOString(),
-    };
-    tasks.set(id, task);
-    return { content: `Created task #${id}: ${task.subject}` };
+      blockedBy: "[]",
+      blocks: "[]",
+    });
+    return { content: `Created task #${id}: ${input["subject"] as string}` };
   },
 };
 
@@ -127,35 +105,36 @@ const updateTaskTool: Tool = {
   isEnabled(): boolean { return true; },
 
   async call(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-    const tasks = getSessionTasks(ctx.sessionId);
     const id = input["id"] as string;
-    const task = tasks.get(id);
+    const existing = dbGetTask(ctx.db, ctx.sessionId, id);
 
-    if (!task) {
+    if (!existing) {
       return { content: `Task #${id} not found`, isError: true };
     }
 
     const changes: string[] = [];
+    const updates: Parameters<typeof dbUpdateTask>[3] = {};
 
     if (input["status"] !== undefined) {
-      task.status = input["status"] as TaskStatus;
-      changes.push(`status → ${task.status}`);
+      updates.status = input["status"] as TaskStatus;
+      changes.push(`status → ${updates.status}`);
     }
 
     if (Array.isArray(input["blockedBy"])) {
-      task.blockedBy = input["blockedBy"] as string[];
-      changes.push(`blockedBy → [${task.blockedBy.join(", ")}]`);
+      updates.blockedBy = JSON.stringify(input["blockedBy"]);
+      changes.push(`blockedBy → [${(input["blockedBy"] as string[]).join(", ")}]`);
     }
 
     if (Array.isArray(input["blocks"])) {
-      task.blocks = input["blocks"] as string[];
-      changes.push(`blocks → [${task.blocks.join(", ")}]`);
+      updates.blocks = JSON.stringify(input["blocks"]);
+      changes.push(`blocks → [${(input["blocks"] as string[]).join(", ")}]`);
     }
 
     if (changes.length === 0) {
       return { content: `Task #${id}: nothing to update`, isError: true };
     }
 
+    dbUpdateTask(ctx.db, ctx.sessionId, id, updates);
     return { content: `Task #${id} updated: ${changes.join("; ")}` };
   },
 };
@@ -177,12 +156,12 @@ const listTasksTool: Tool = {
   isEnabled(): boolean { return true; },
 
   async call(_input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-    const tasks = getSessionTasks(ctx.sessionId);
-    if (tasks.size === 0) {
+    const rows = dbListTasks(ctx.db, ctx.sessionId);
+    if (rows.length === 0) {
       return { content: "No tasks in this session." };
     }
 
-    const lines = Array.from(tasks.values()).map(t => {
+    const lines = rows.map(rowToTask).map(t => {
       const statusIcon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "→" : "○";
       return `${statusIcon} #${t.id} [${t.status}] ${t.subject}`;
     });
@@ -211,14 +190,14 @@ const getTaskTool: Tool = {
   isEnabled(): boolean { return true; },
 
   async call(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-    const tasks = getSessionTasks(ctx.sessionId);
     const id = input["id"] as string;
-    const task = tasks.get(id);
+    const row = dbGetTask(ctx.db, ctx.sessionId, id);
 
-    if (!task) {
+    if (!row) {
       return { content: `Task #${id} not found`, isError: true };
     }
 
+    const task = rowToTask(row);
     return {
       content: [
         `#${task.id} — ${task.subject}`,

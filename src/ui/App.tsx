@@ -292,6 +292,30 @@ export function App(props: AppProps): React.ReactElement {
         entries.addEntry({ kind: "notice", content: "Goodbye! Session saved.", level: "success" });
         setPendingExit(true);
         break;
+
+      case "agent_plan_start":
+        entries.addEntry({ kind: "notice", content: "Planning tasks...", level: "info" });
+        break;
+
+      case "agent_task_start":
+        entries.addEntry({
+          kind: "notice",
+          content: `Task ${event.index}/${event.total}: ${event.subject}`,
+          level: "info",
+        });
+        break;
+
+      case "agent_task_done":
+        entries.addEntry({
+          kind: "notice",
+          content: `✓ ${event.subject}`,
+          level: event.status === "completed" ? "success" : "error",
+        });
+        break;
+
+      case "agent_reflect_start":
+        entries.addEntry({ kind: "notice", content: "Reflecting on results...", level: "info" });
+        break;
     }
   }, [streaming, entries]);
 

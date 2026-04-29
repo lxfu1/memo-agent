@@ -7,7 +7,7 @@
 
 import Database from "better-sqlite3";
 import path from "node:path";
-import type { MessageRow, SearchResultRow, SessionRow } from "../types/session.js";
+import type { MessageRow, SearchResultRow, SessionRow, TaskRow, TaskStatus } from "../types/session.js";
 import type { ChatMessage, OpenAIToolCall } from "../types/messages.js";
 
 const DB_FILE = "sessions.db";
@@ -123,6 +123,21 @@ BEGIN
   INSERT INTO messages_fts(messages_fts, rowid, content, session_id)
   VALUES ('delete', old.id, old.content, old.session_id);
 END;
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id          TEXT NOT NULL,
+  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  subject     TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status      TEXT NOT NULL DEFAULT 'pending',
+  blocked_by  TEXT NOT NULL DEFAULT '[]',
+  blocks      TEXT NOT NULL DEFAULT '[]',
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (session_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id);
 `;
 
 // ---------------------------------------------------------------------------
@@ -291,4 +306,83 @@ export function searchMessages(
     // FTS5 syntax error — return empty results rather than crashing
     return [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// Task operations
+// ---------------------------------------------------------------------------
+
+/** Inserts a new task row for the given session */
+export function dbCreateTask(
+  db: Database.Database,
+  sessionId: string,
+  task: Omit<TaskRow, "sessionId" | "createdAt" | "updatedAt">
+): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO tasks (id, session_id, subject, description, status, blocked_by, blocks, created_at, updated_at)
+    VALUES (@id, @sessionId, @subject, @description, @status, @blockedBy, @blocks, @createdAt, @updatedAt)
+  `).run({ ...task, sessionId, createdAt: now, updatedAt: now });
+}
+
+/** Updates mutable fields of an existing task */
+export function dbUpdateTask(
+  db: Database.Database,
+  sessionId: string,
+  taskId: string,
+  updates: { status?: TaskStatus; blockedBy?: string; blocks?: string }
+): void {
+  const now = new Date().toISOString();
+  const fields: string[] = ["updated_at = @updatedAt"];
+  const params: Record<string, unknown> = { taskId, sessionId, updatedAt: now };
+
+  if (updates.status !== undefined) {
+    fields.push("status = @status");
+    params["status"] = updates.status;
+  }
+  if (updates.blockedBy !== undefined) {
+    fields.push("blocked_by = @blockedBy");
+    params["blockedBy"] = updates.blockedBy;
+  }
+  if (updates.blocks !== undefined) {
+    fields.push("blocks = @blocks");
+    params["blocks"] = updates.blocks;
+  }
+
+  db.prepare(`UPDATE tasks SET ${fields.join(", ")} WHERE id = @taskId AND session_id = @sessionId`).run(params);
+}
+
+/** Returns all tasks for a session, ordered by numeric ID */
+export function dbListTasks(db: Database.Database, sessionId: string): TaskRow[] {
+  return db.prepare(`
+    SELECT id, session_id AS sessionId, subject, description, status,
+           blocked_by AS blockedBy, blocks, created_at AS createdAt, updated_at AS updatedAt
+    FROM tasks
+    WHERE session_id = ?
+    ORDER BY CAST(id AS INTEGER) ASC, created_at ASC
+  `).all(sessionId) as TaskRow[];
+}
+
+/** Returns a single task by ID, or null if not found */
+export function dbGetTask(db: Database.Database, sessionId: string, taskId: string): TaskRow | null {
+  const row = db.prepare(`
+    SELECT id, session_id AS sessionId, subject, description, status,
+           blocked_by AS blockedBy, blocks, created_at AS createdAt, updated_at AS updatedAt
+    FROM tasks
+    WHERE id = ? AND session_id = ?
+  `).get(taskId, sessionId) as TaskRow | undefined;
+  return row ?? null;
+}
+
+/** Deletes all tasks for a session */
+export function dbClearSessionTasks(db: Database.Database, sessionId: string): void {
+  db.prepare("DELETE FROM tasks WHERE session_id = ?").run(sessionId);
+}
+
+/** Returns the next available task ID (max numeric ID + 1) for a session */
+export function dbNextTaskId(db: Database.Database, sessionId: string): string {
+  const row = db.prepare(
+    "SELECT MAX(CAST(id AS INTEGER)) AS maxId FROM tasks WHERE session_id = ?"
+  ).get(sessionId) as { maxId: number | null };
+  return String((row.maxId ?? 0) + 1);
 }

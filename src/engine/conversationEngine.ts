@@ -17,6 +17,9 @@ import type OpenAI from "openai";
 import {
   appendMessage,
   createSession,
+  dbGetTask,
+  dbListTasks,
+  dbUpdateTask,
   loadMessagesForSession,
   pruneOldSessions,
   rowsToChatMessages,
@@ -35,7 +38,7 @@ import { getToolsAsOpenAIFunctions } from "../tools/registry.js";
 import { type PermissionRequest } from "../permissions/guard.js";
 import { routeCommand, type CommandContext } from "./commandRouter.js";
 import { expandRecipe } from "../recipes/recipeRegistry.js";
-import { clearSessionTasks } from "../tools/tasks.js";
+import type { Task } from "../tools/tasks.js";
 import type { ChatMessage, OpenAIToolCall, TokenUsage } from "../types/messages.js";
 import type { MemoAgentConfig } from "../types/config.js";
 import type { Recipe } from "../recipes/recipeRegistry.js";
@@ -70,7 +73,11 @@ export type EngineEvent =
   | { type: "permission_resolved"; requestId: string; decision: PermissionDecision }
   | { type: "exit_requested" }
   | { type: "injection_warning"; source: string }
-  | { type: "error"; message: string; code: string };
+  | { type: "error"; message: string; code: string }
+  | { type: "agent_plan_start" }
+  | { type: "agent_task_start"; taskId: string; subject: string; index: number; total: number }
+  | { type: "agent_task_done"; taskId: string; subject: string; status: "completed" | "failed" }
+  | { type: "agent_reflect_start" };
 
 export interface SessionUsage {
   totalInputTokens: number;
@@ -300,13 +307,24 @@ export class ConversationEngine {
   // Tool call loop
   // ---------------------------------------------------------------------------
 
-  private async *runToolCallLoop(systemPrompt: string): AsyncGenerator<EngineEvent, void, unknown> {
+  private async *runToolCallLoop(
+    systemPrompt: string,
+    opts?: { allowedToolNames?: string[]; maxRounds?: number }
+  ): AsyncGenerator<EngineEvent, void, unknown> {
     this.abortController = new AbortController();
     let rounds = 0;
 
-    const toolDefs = getToolsAsOpenAIFunctions();
+    const allToolDefs = getToolsAsOpenAIFunctions();
+    const toolDefs = opts?.allowedToolNames
+      ? allToolDefs.filter(t => {
+          const name = (t as { function?: { name?: string } }).function?.name;
+          return name !== undefined && (opts.allowedToolNames as string[]).includes(name);
+        })
+      : allToolDefs;
 
-    while (rounds < MAX_TOOL_CALL_ROUNDS) {
+    const maxRounds = opts?.maxRounds ?? MAX_TOOL_CALL_ROUNDS;
+
+    while (rounds < maxRounds) {
       rounds++;
 
       let streamDone = false;
@@ -393,10 +411,10 @@ export class ConversationEngine {
       break;
     }
 
-    if (rounds >= MAX_TOOL_CALL_ROUNDS) {
+    if (rounds >= maxRounds) {
       yield {
         type: "error",
-        message: `Reached maximum tool call rounds (${MAX_TOOL_CALL_ROUNDS}). Use /clear to reset context.`,
+        message: `Reached maximum tool call rounds (${maxRounds}). Use /clear to reset context.`,
         code: "MAX_ROUNDS_EXCEEDED",
       };
     }
@@ -492,6 +510,121 @@ export class ConversationEngine {
   }
 
   // ---------------------------------------------------------------------------
+  // Agent Loop: Plan → Execute → Reflect
+  // ---------------------------------------------------------------------------
+
+  private async *runAgentLoop(
+    systemPrompt: string,
+    goal: string
+  ): AsyncGenerator<EngineEvent, void, unknown> {
+    // === PHASE 1: PLAN ===
+    yield { type: "agent_plan_start" };
+
+    const planningContent = buildPlanningPrompt(goal);
+    const planningMsg: ChatMessage = { role: "user", content: planningContent };
+    this.messages = [...this.messages, planningMsg];
+    appendMessage(this.opts.db, {
+      sessionId: this.sessionId,
+      role: "user",
+      content: planningContent,
+      toolCallsJson: null,
+      toolCallId: null,
+      tokenCount: 0,
+    });
+
+    if (this.isFirstMessage) {
+      this.isFirstMessage = false;
+      setSessionTitle(this.opts.db, this.sessionId, `[plan] ${goal.slice(0, 75)}`);
+    }
+
+    yield { type: "messages_updated", messages: this.messages };
+    yield this.buildUsageEvent(systemPrompt);
+
+    // Planning phase: model may only call CreateTask
+    yield* this.runToolCallLoop(systemPrompt, { allowedToolNames: ["CreateTask"], maxRounds: 8 });
+
+    // Load tasks created during planning phase
+    const createdRows = dbListTasks(this.opts.db, this.sessionId);
+    const createdTasks: Task[] = createdRows.map(r => ({
+      id: r.id,
+      subject: r.subject,
+      description: r.description,
+      status: r.status,
+      blockedBy: JSON.parse(r.blockedBy) as string[],
+      blocks: JSON.parse(r.blocks) as string[],
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+    }));
+
+    if (createdTasks.length === 0) {
+      yield { type: "command_output", message: "No tasks were planned. Executing directly.", kind: "info" };
+      yield* this.runToolCallLoop(systemPrompt);
+      return;
+    }
+
+    // === PHASE 2: EXECUTE ===
+    const orderedTasks = resolveExecutionOrder(createdTasks);
+    const total = orderedTasks.length;
+
+    for (let i = 0; i < orderedTasks.length; i++) {
+      const task = orderedTasks[i] as Task;
+      const index = i + 1;
+
+      dbUpdateTask(this.opts.db, this.sessionId, task.id, { status: "in_progress" });
+      yield { type: "agent_task_start", taskId: task.id, subject: task.subject, index, total };
+
+      const execContent = buildTaskExecutionPrompt(task, index, total);
+      const execMsg: ChatMessage = { role: "user", content: execContent };
+      this.messages = [...this.messages, execMsg];
+      appendMessage(this.opts.db, {
+        sessionId: this.sessionId,
+        role: "user",
+        content: execContent,
+        toolCallsJson: null,
+        toolCallId: null,
+        tokenCount: 0,
+      });
+
+      yield { type: "messages_updated", messages: this.messages };
+      yield this.buildUsageEvent(systemPrompt);
+
+      yield* this.runToolCallLoop(systemPrompt);
+
+      // Mark completed if model didn't do so explicitly
+      const freshRow = dbGetTask(this.opts.db, this.sessionId, task.id);
+      if (freshRow?.status !== "completed") {
+        dbUpdateTask(this.opts.db, this.sessionId, task.id, { status: "completed" });
+      }
+
+      yield { type: "agent_task_done", taskId: task.id, subject: task.subject, status: "completed" };
+    }
+
+    // === PHASE 3: REFLECT ===
+    yield { type: "agent_reflect_start" };
+
+    const reflectContent = buildReflectPrompt(total);
+    const reflectMsg: ChatMessage = { role: "user", content: reflectContent };
+    this.messages = [...this.messages, reflectMsg];
+    appendMessage(this.opts.db, {
+      sessionId: this.sessionId,
+      role: "user",
+      content: reflectContent,
+      toolCallsJson: null,
+      toolCallId: null,
+      tokenCount: 0,
+    });
+
+    yield { type: "messages_updated", messages: this.messages };
+    yield this.buildUsageEvent(systemPrompt);
+
+    // Reflect: read-only tools only, single pass
+    yield* this.runToolCallLoop(systemPrompt, {
+      allowedToolNames: ["ReadFile", "ListFiles", "SearchCode", "ListTasks", "GetTask"],
+      maxRounds: 2,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Command handling
   // ---------------------------------------------------------------------------
 
@@ -520,7 +653,6 @@ export class ConversationEngine {
         break;
 
       case "clear_session":
-        clearSessionTasks(this.sessionId);
         this.messages = [];
         this.isFirstMessage = true;
         this.sessionId = crypto.randomUUID();
@@ -582,7 +714,6 @@ export class ConversationEngine {
           };
           break;
         }
-        clearSessionTasks(this.sessionId);
         this.messages = rowsToChatMessages(rows);
         this.sessionId = targetId;
         this.isFirstMessage = false;
@@ -607,6 +738,15 @@ export class ConversationEngine {
       case "exit":
         yield { type: "exit_requested" };
         break;
+
+      case "agent_plan": {
+        const systemPrompt = await this.sysPromptManager.get(this.buildPromptOptions());
+        for (const source of this.sysPromptManager.drainWarnings()) {
+          yield { type: "injection_warning", source };
+        }
+        yield* this.runAgentLoop(systemPrompt, result.goal);
+        break;
+      }
 
       case "unknown":
         yield {
@@ -764,4 +904,77 @@ Rules:
     const messages = rowsToChatMessages(rows);
     return new ConversationEngine({ ...opts, sessionId, initialMessages: messages });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Agent loop helpers (module-level pure functions)
+// ---------------------------------------------------------------------------
+
+function buildPlanningPrompt(goal: string): string {
+  return `<agent-planning>
+Goal: ${goal}
+
+Before doing anything else, break this goal into concrete, actionable tasks using CreateTask.
+Create 3-7 tasks maximum. Use the blockedBy field (task IDs) to express dependencies.
+Only call CreateTask during this planning phase. Do not execute any other actions yet.
+</agent-planning>`;
+}
+
+function buildTaskExecutionPrompt(task: Task, index: number, total: number): string {
+  return `<agent-task index="${index}" total="${total}">
+Now execute task #${task.id}: ${task.subject}
+${task.description}
+
+Use the available tools to complete this task fully.
+When done, call UpdateTask to mark task #${task.id} as "completed".
+</agent-task>`;
+}
+
+function buildReflectPrompt(total: number): string {
+  return `<agent-reflect>
+All ${total} planned tasks have been executed. Provide a concise 2-3 sentence summary of what was accomplished and any important outcomes or side effects.
+</agent-reflect>`;
+}
+
+/** Topological sort (Kahn's algorithm) respecting blockedBy dependencies */
+function resolveExecutionOrder(tasks: Task[]): Task[] {
+  if (tasks.length === 0) return [];
+
+  const taskMap = new Map(tasks.map(t => [t.id, t]));
+  const inDegree = new Map<string, number>(tasks.map(t => [t.id, 0]));
+
+  for (const task of tasks) {
+    for (const depId of task.blockedBy) {
+      if (taskMap.has(depId)) {
+        inDegree.set(task.id, (inDegree.get(task.id) ?? 0) + 1);
+      }
+    }
+  }
+
+  const queue: Task[] = tasks.filter(t => (inDegree.get(t.id) ?? 0) === 0);
+  const ordered: Task[] = [];
+
+  while (queue.length > 0) {
+    const task = queue.shift() as Task;
+    ordered.push(task);
+
+    for (const other of tasks) {
+      if (other.blockedBy.includes(task.id)) {
+        const newDeg = (inDegree.get(other.id) ?? 0) - 1;
+        inDegree.set(other.id, newDeg);
+        if (newDeg === 0) {
+          queue.push(taskMap.get(other.id) as Task);
+        }
+      }
+    }
+  }
+
+  // Append tasks with circular dependencies (fallback: run them anyway)
+  for (const task of tasks) {
+    if (!ordered.some(o => o.id === task.id)) {
+      ordered.push(task);
+    }
+  }
+
+  return ordered;
 }
